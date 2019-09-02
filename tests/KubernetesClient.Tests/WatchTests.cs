@@ -71,15 +71,6 @@ namespace k8s.Tests
                 {
                     listTask.Watch<V1Pod>((type, item) => { });
                 });
-
-                // server did not response line by line
-                await Assert.ThrowsAnyAsync<Exception>(() =>
-                {
-                    return client.ListNamespacedPodWithHttpMessagesAsync("default", watch: true);
-
-                    // this line did not throw
-                    // listTask.Watch<Corev1Pod>((type, item) => { });
-                });
             }
         }
 
@@ -159,6 +150,80 @@ namespace k8s.Tests
                 Assert.True(connectionClosed.IsSet);
             }
         }
+
+        [Fact]
+        public async Task SuriveInitialBadLine()
+        {
+            AsyncCountdownEvent eventsReceived = new AsyncCountdownEvent(2);
+            AsyncManualResetEvent serverShutdown = new AsyncManualResetEvent();
+            AsyncManualResetEvent connectionClosed = new AsyncManualResetEvent();
+
+            using (var server =
+                new MockKubeApiServer(
+                    testOutput,
+                    async httpContext =>
+                    {
+                        httpContext.Response.StatusCode = (int)HttpStatusCode.OK;
+                        httpContext.Response.ContentLength = null;
+
+                        await WriteStreamLine(httpContext, MockBadStreamLine);
+                        await WriteStreamLine(httpContext, MockAddedEventStreamLine);
+
+                        // make server alive, cannot set to int.max as of it would block response
+                        await serverShutdown.WaitAsync();
+                        return false;
+                    }))
+            {
+                var client = new Kubernetes(new KubernetesClientConfiguration
+                {
+                    Host = server.Uri.ToString()
+                });
+
+                var listTask = await client.ListNamespacedPodWithHttpMessagesAsync("default", watch: true);
+
+                var events = new HashSet<WatchEventType>();
+                var errors = 0;
+
+                var watcher = listTask.Watch<V1Pod>(
+                    (type, item) =>
+                    {
+                        testOutput.WriteLine($"Watcher received '{type}' event.");
+
+                        events.Add(type);
+                        eventsReceived.Signal();
+                    },
+                    error =>
+                    {
+                        testOutput.WriteLine($"Watcher received '{error.GetType().FullName}' error.");
+
+                        errors += 1;
+                        eventsReceived.Signal();
+                    },
+                    onClosed: connectionClosed.Set
+                );
+
+                // wait server yields all events
+                await Task.WhenAny(eventsReceived.WaitAsync(), Task.Delay(TestTimeout));
+
+                Assert.True(
+                    eventsReceived.CurrentCount == 0,
+                    "Timed out waiting for all events / errors to be received."
+                );
+
+                Assert.Contains(WatchEventType.Added, events);
+
+                Assert.Equal(1, errors);
+
+                Assert.True(watcher.Watching);
+
+                // Let the server know it can initiate a shut down.
+                serverShutdown.Set();
+
+                await Task.WhenAny(connectionClosed.WaitAsync(), Task.Delay(TestTimeout));
+                Assert.True(connectionClosed.IsSet);
+            }
+        }
+
 
         [Fact]
         public async Task DisposeWatch()
@@ -298,6 +363,80 @@ namespace k8s.Tests
                 Assert.False(watcher.Watching);
             }
         }
+
+        [Fact]
+        public async Task WatchEventsDelayBeforeInitialChangeNotification()
+        {
+            AsyncCountdownEvent eventsReceived = new AsyncCountdownEvent(1 /* Expecting a single Added event for this test */);
+            AsyncManualResetEvent serverShutdown = new AsyncManualResetEvent();
+            var waitForClosed = new AsyncManualResetEvent(false);
+
+            using (var server = new MockKubeApiServer(testOutput, async httpContext =>
+            {
+                await httpContext.Response.Body.FlushAsync();
+                await Task.Delay(TimeSpan.FromSeconds(10)); //simulate delay between connection establishment and initial change notification
+                await WriteStreamLine(httpContext, MockAddedEventStreamLine);
+
+                // make server alive, cannot set to int.max as of it would block response
+                await serverShutdown.WaitAsync();
+                return false;
+            }))
+            {
+                var client = new Kubernetes(new KubernetesClientConfiguration
+                {
+                    Host = server.Uri.ToString()
+                });
+
+                var listTask = client.ListNamespacedPodWithHttpMessagesAsync("default", watch: true);
+
+                // assert that the list call returns within 1 second 
+                // this proves that the list call with watch enabled returns after the connection is established
+                // but before the first change notification has been received
+                Assert.True(await Task.WhenAny(listTask, Task.Delay(TimeSpan.FromSeconds(1))) == listTask,
+                                "List request with watch enabled failed to return before first change notification received"); 
+
+                var events = new HashSet<WatchEventType>();
+                var errors = 0;
+
+                var watcher = listTask.Result.Watch<V1Pod>(
+                    (type, item) =>
+                    {
+                        testOutput.WriteLine($"Watcher received '{type}' event.");
+
+                        events.Add(type);
+                        eventsReceived.Signal();
+                    },
+                    error =>
+                    {
+                        testOutput.WriteLine($"Watcher received '{error.GetType().FullName}' error.");
+
+                        errors += 1;
+                        eventsReceived.Signal();
+                    },
+                    onClosed: waitForClosed.Set
+                );
+
+                // wait server yields all events
+                await Task.WhenAny(eventsReceived.WaitAsync(), Task.Delay(TestTimeout));
+
+                Assert.True(
+                    eventsReceived.CurrentCount == 0,
+                    "Timed out waiting for all events / errors to be received."
+                );
+
+                Assert.Contains(WatchEventType.Added, events);
+                Assert.Equal(0, errors);
+
+                Assert.True(watcher.Watching);
+
+                serverShutdown.Set();
+
+                await Task.WhenAny(waitForClosed.WaitAsync(), Task.Delay(TestTimeout));
+                Assert.True(waitForClosed.IsSet);
+                Assert.False(watcher.Watching);
+            }
+        }
+
 
         [Fact]
         public async Task WatchEventsWithTimeout()
